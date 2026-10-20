@@ -326,7 +326,7 @@ class MainActivity : Activity() {
                 }
             }
             setOnScrollChangeListener { _, _, scrollY, _, _ ->
-                if (::overlay.isInitialized) overlay.setDocumentScroll(scrollY)
+                if (this@MainActivity::overlay.isInitialized) this@MainActivity.overlay.setDocumentScroll(scrollY)
                 // Only a moving screenshot is invalid; OCR/translation already captured
                 // remains anchored at activeCaptureY and can finish while reading.
                 if (scanning) {
