@@ -1,9 +1,0 @@
-<resources>
-    <style name="Theme.MangaLens" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#5CDEFF</item>
-        <item name="android:statusBarColor">#17191F</item>
-        <item name="android:navigationBarColor">#17191F</item>
-        <item name="android:windowLightStatusBar">false</item>
-    </style>
-</resources>
