@@ -28,6 +28,7 @@ import android.widget.TextView
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.net.Uri
@@ -38,6 +39,11 @@ import fr.mangalens.ocr.OcrEngine
 import fr.mangalens.overlay.TranslationOverlayView
 import fr.mangalens.scan.ScreenCapture
 import fr.mangalens.translate.OfflineTranslator
+import fr.mangalens.translate.QualityTranslator
+import fr.mangalens.network.AdBlocker
+import java.io.ByteArrayInputStream
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 import java.util.Locale
 
 /** A self-contained native browser, with a screenshot-based translation overlay. */
@@ -51,10 +57,42 @@ class MainActivity : Activity() {
     private lateinit var targetSpinner: Spinner
     private lateinit var autoCheck: CheckBox
     private lateinit var originalButton: Button
+    private lateinit var adBlockButton: Button
+    private lateinit var qualityButton: Button
     private val ocr = OcrEngine()
     private val translator = OfflineTranslator()
+    private lateinit var qualityTranslator: QualityTranslator
+    private val adBlockEnabled = AtomicBoolean(true)
+    private var qualityEnabled = false
+    private var touchStartY = 0f
+    private var touchStartScroll = 0
+    private var movedByTouch = false
+    private var activeCaptureY = 0
     private var generation = 0
     private var scanning = false
+    private var capturing = false
+    private var imageSignature: String? = null
+    private val imageWatcher = object : Runnable {
+        override fun run() {
+            if (destroyed) return
+            if (autoCheck.isChecked && !showOriginal) {
+                webView.evaluateJavascript("""
+                    JSON.stringify(Array.from(document.images).filter(i => {
+                        const r = i.getBoundingClientRect();
+                        return r.bottom > 0 && r.top < innerHeight;
+                    }).map(i => [i.currentSrc, i.complete, i.naturalWidth,
+                        Math.round(i.getBoundingClientRect().top + scrollY),
+                        Math.round(i.getBoundingClientRect().height)]))
+                """.trimIndent()) { value ->
+                    if (!destroyed && imageSignature != value) {
+                        imageSignature = value
+                        if (autoCheck.isChecked && !showOriginal) queueAutoScan()
+                    }
+                }
+            }
+            handler.postDelayed(this, 2500L)
+        }
+    }
     private var pending = false
     private var destroyed = false
     private var showOriginal = false
@@ -65,12 +103,16 @@ class MainActivity : Activity() {
     private val accent = Color.rgb(92, 222, 255)
     private val white = Color.rgb(245, 246, 248)
     private val muted = Color.rgb(182, 189, 197)
-    private val scrollRunnable = Runnable { requestScan() }
+    private val scrollRunnable = Runnable { if (autoCheck.isChecked && !showOriginal) requestScan() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.statusBarColor = Color.rgb(23, 25, 31)
         window.navigationBarColor = Color.rgb(23, 25, 31)
+        qualityTranslator = QualityTranslator(this)
+        val prefs = getPreferences(MODE_PRIVATE)
+        adBlockEnabled.set(prefs.getBoolean("ad_block_enabled", true))
+        qualityEnabled = prefs.getBoolean("quality_translation_enabled", false) && qualityTranslator.hasKey()
         buildUi()
         if (savedInstanceState == null) {
             val last = getPreferences(MODE_PRIVATE).getString("last_site", null)
@@ -110,7 +152,7 @@ class MainActivity : Activity() {
             setTypeface(null, android.graphics.Typeface.BOLD)
         }, LinearLayout.LayoutParams(0, -2, 1f))
         titleRow.addView(TextView(this).apply {
-            text = "ANDROID · V0.1"
+            text = "ANDROID · V0.3"
             textSize = 10f
             setTextColor(muted)
         })
@@ -174,11 +216,11 @@ class MainActivity : Activity() {
         }
         root.addView(modesRow, LinearLayout.LayoutParams(-1, dp(41)))
         autoCheck = CheckBox(this).apply {
-            text = "Auto-défilement"
+            text = "Trad. continue"
             textSize = 12f
             setTextColor(white)
             buttonTintList = android.content.res.ColorStateList.valueOf(accent)
-            isChecked = false
+            isChecked = getPreferences(MODE_PRIVATE).getBoolean("continuous_translation", true)
         }
         modesRow.addView(autoCheck, LinearLayout.LayoutParams(0, -1, 1f))
         originalButton = button("Voir l’original", false).apply { textSize = 12f }
@@ -187,10 +229,41 @@ class MainActivity : Activity() {
             showOriginal = !showOriginal
             overlay.revealOriginal(showOriginal)
             originalButton.text = if (showOriginal) "Voir traduction" else "Voir l’original"
+            if (!showOriginal && autoCheck.isChecked) queueAutoScan()
         }
         val demo = button("Démo", false).apply { textSize = 11f }
         modesRow.addView(demo, LinearLayout.LayoutParams(dp(64), dp(34)).apply { marginStart = dp(5) })
         demo.setOnClickListener { loadDemo() }
+
+        val extraRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), 0, dp(10), dp(3))
+        }
+        root.addView(extraRow, LinearLayout.LayoutParams(-1, dp(39)))
+        adBlockButton = button("", false).apply { textSize = 12f }
+        updateAdBlockLabel()
+        extraRow.addView(adBlockButton, LinearLayout.LayoutParams(0, dp(34), 1f).apply { marginEnd = dp(5) })
+        adBlockButton.setOnClickListener {
+            val enabled = !adBlockEnabled.get()
+            adBlockEnabled.set(enabled)
+            getPreferences(MODE_PRIVATE).edit().putBoolean("ad_block_enabled", enabled).apply()
+            updateAdBlockLabel()
+            status.text = "Anti-pub ${if (enabled) "activé" else "désactivé"} — recharge le site pour appliquer"
+        }
+        qualityButton = button("", false).apply { textSize = 12f }
+        updateQualityLabel()
+        extraRow.addView(qualityButton, LinearLayout.LayoutParams(0, dp(34), 1f))
+        qualityButton.setOnClickListener {
+            if (!qualityTranslator.hasKey()) showQualityKeyDialog() else {
+                qualityEnabled = !qualityEnabled
+                getPreferences(MODE_PRIVATE).edit().putBoolean("quality_translation_enabled", qualityEnabled).apply()
+                updateQualityLabel()
+                invalidatePage(autoCheck.isChecked)
+                status.text = if (qualityEnabled) "Traduction IA activée (Internet, quota/API requis)" else "Traduction locale activée"
+            }
+        }
+        qualityButton.setOnLongClickListener { showQualityKeyDialog(); true }
 
         status = TextView(this).apply {
             text = "Prêt — choisir les langues puis Traduire"
@@ -199,7 +272,7 @@ class MainActivity : Activity() {
             setPadding(dp(13), dp(4), dp(10), dp(5))
             maxLines = 2
         }
-        root.addView(status, LinearLayout.LayoutParams(-1, dp(34)))
+        root.addView(status, LinearLayout.LayoutParams(-1, dp(36)))
 
         val browsingArea = FrameLayout(this)
         root.addView(browsingArea, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -221,10 +294,23 @@ class MainActivity : Activity() {
             if (android.os.Build.VERSION.SDK_INT >= 26) settings.safeBrowsingEnabled = true
             webChromeClient = WebChromeClient()
             webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                    // Called on a background WebView thread: only use AtomicBoolean + pure host check.
+                    val req = request ?: return null
+                    if (req.isForMainFrame || !adBlockEnabled.get() || !AdBlocker.shouldBlock(req.url.host)) return null
+                    return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+                }
+                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                    invalidatePage(false)
+                }
+                override fun onScaleChanged(view: WebView?, oldScale: Float, newScale: Float) {
+                    if (abs(oldScale - newScale) > 0.02f) invalidatePage(autoCheck.isChecked)
+                }
                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                     val scheme = request?.url?.scheme?.lowercase(Locale.ROOT)
                     // Do not launch intent:, file:, javascript: or custom schemes.
-                    return scheme != "https"
+                    return scheme != "https" ||
+                        (adBlockEnabled.get() && AdBlocker.shouldBlock(request?.url?.host))
                 }
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (destroyed) return
@@ -239,26 +325,50 @@ class MainActivity : Activity() {
                     if (request?.isForMainFrame == true) status.text = "Chargement impossible : ${error?.description ?: "erreur réseau"}"
                 }
             }
-            setOnScrollChangeListener { _, _, _, _, _ -> invalidatePage(autoCheck.isChecked) }
+            setOnScrollChangeListener { _, _, scrollY, _, _ ->
+                if (::overlay.isInitialized) overlay.setDocumentScroll(scrollY)
+                // Only a moving screenshot is invalid; OCR/translation already captured
+                // remains anchored at activeCaptureY and can finish while reading.
+                if (scanning) {
+                    if (capturing) generation++
+                    pending = autoCheck.isChecked && !showOriginal
+                }
+                if (autoCheck.isChecked && !showOriginal) queueAutoScan()
+            }
             setOnTouchListener { _, motion ->
                 when (motion.actionMasked) {
-                    MotionEvent.ACTION_MOVE -> invalidatePage(autoCheck.isChecked)
+                    MotionEvent.ACTION_DOWN -> {
+                        touchStartY = motion.y
+                        touchStartScroll = scrollY
+                        movedByTouch = false
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (abs(motion.y - touchStartY) > dp(13)) movedByTouch = true
+                    }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        if (autoCheck.isChecked) queueAutoScan()
+                        if (movedByTouch && touchStartScroll == scrollY) {
+                            // Some sites scroll a nested DIV instead of WebView itself.
+                            // Its internal offset is unknown: avoid drawing cached regions in wrong places.
+                            invalidatePage(autoCheck.isChecked)
+                        } else if (movedByTouch && autoCheck.isChecked && !showOriginal) {
+                            queueAutoScan()
+                        }
+                        movedByTouch = false
                     }
                 }
-                false // Preserve all scrolling, zoom, and taps inside WebView.
+                false // All taps, gestures and scrolling continue through to the website.
             }
         }
         browsingArea.addView(webView, FrameLayout.LayoutParams(-1, -1))
         overlay = TranslationOverlayView(this)
         browsingArea.addView(overlay, FrameLayout.LayoutParams(-1, -1))
 
+        handler.postDelayed(imageWatcher, 2500L)
         sourceSpinner.onItemSelectedListener = languageChangedListener()
         targetSpinner.onItemSelectedListener = languageChangedListener()
         autoCheck.setOnCheckedChangeListener { _, checked ->
-            if (checked) queueAutoScan()
-            else handler.removeCallbacks(scrollRunnable)
+            getPreferences(MODE_PRIVATE).edit().putBoolean("continuous_translation", checked).apply()
+            if (checked) queueAutoScan() else handler.removeCallbacks(scrollRunnable)
         }
     }
 
@@ -267,6 +377,39 @@ class MainActivity : Activity() {
         override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
             if (::overlay.isInitialized) invalidatePage(autoCheck.isChecked)
         }
+    }
+
+    private fun updateAdBlockLabel() {
+        adBlockButton.text = if (adBlockEnabled.get()) "Anti-pub : ON" else "Anti-pub : OFF"
+    }
+
+    private fun updateQualityLabel() {
+        qualityButton.text = if (qualityEnabled) "Qualité IA : ON" else "Qualité IA : OFF"
+    }
+
+    private fun showQualityKeyDialog() {
+        val field = EditText(this).apply {
+            hint = "Clé API Gemini (Google AI Studio)"
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Traduction IA (facultative)")
+            .setMessage("La clé est chiffrée sur ce téléphone. Seuls les dialogues OCR sont envoyés à Gemini, pas les images. Cette option utilise Internet et peut consommer un quota payant. Appui long sur le bouton IA pour modifier/supprimer la clé. Saisis une clé, ou laisse vide pour la supprimer.")
+            .setView(field)
+            .setPositiveButton("Enregistrer") { _, _ ->
+                val entered = field.text.toString().trim()
+                if (qualityTranslator.saveKey(entered)) {
+                    qualityEnabled = entered.isNotEmpty()
+                    getPreferences(MODE_PRIVATE).edit().putBoolean("quality_translation_enabled", qualityEnabled).apply()
+                    updateQualityLabel()
+                    invalidatePage(autoCheck.isChecked)
+                    status.text = if (qualityEnabled) "Qualité IA activée" else "Clé supprimée, mode local"
+                } else status.text = "Erreur de stockage sécurisé de la clé"
+            }
+            .setNegativeButton("Annuler", null)
+            .show()
     }
 
     private fun spinner(labels: List<String>): Spinner = Spinner(this).apply {
@@ -334,15 +477,18 @@ class MainActivity : Activity() {
     private fun invalidatePage(auto: Boolean) {
         if (destroyed || !::overlay.isInitialized) return
         generation++
+        imageSignature = null
+        pending = false
         overlay.clear()
+        overlay.setDocumentScroll(webView.scrollY)
         handler.removeCallbacks(scrollRunnable)
         if (auto) queueAutoScan()
     }
 
     private fun queueAutoScan() {
-        if (destroyed) return
+        if (destroyed || !::autoCheck.isInitialized) return
         handler.removeCallbacks(scrollRunnable)
-        handler.postDelayed(scrollRunnable, 950L)
+        handler.postDelayed(scrollRunnable, 650L)
     }
 
     private fun requestScan() {
@@ -360,7 +506,7 @@ class MainActivity : Activity() {
             return
         }
         val prefs = getPreferences(MODE_PRIVATE)
-        if (!prefs.getBoolean("model_download_consent", false)) {
+        if (!(qualityEnabled && qualityTranslator.hasKey()) && !prefs.getBoolean("model_download_consent", false)) {
             AlertDialog.Builder(this)
                 .setTitle("Modèles de traduction")
                 .setMessage("La première traduction peut télécharger des modèles d’environ 30 Mo par langue. Ensuite, la traduction s’effectue sur ton téléphone. Autoriser ces téléchargements ?")
@@ -379,18 +525,27 @@ class MainActivity : Activity() {
             return
         }
         scanning = true
+        capturing = true
         val scanId = ++generation
         showOriginal = false
         overlay.revealOriginal(false)
         originalButton.text = "Voir l’original"
-        overlay.clear()
         translatedCount = 0
         translationFailures = 0
-        status.text = "Capture de la page visible…"
-        // Let the compositor display the unaltered page before PixelCopy.
+        status.text = "Analyse de cette partie du chapitre…"
+        activeCaptureY = webView.scrollY
+        // PixelCopy captures the whole window, including our overlay: hide it first,
+        // otherwise the OCR would read French translations instead of original dialogue.
+        overlay.visibility = View.INVISIBLE
         handler.postDelayed({
-            if (scanId != generation || destroyed) { finishScan(); return@postDelayed }
+            if (scanId != generation || destroyed) {
+                overlay.visibility = View.VISIBLE
+                finishScan()
+                return@postDelayed
+            }
             ScreenCapture.capture(this, webView) { bitmap, error ->
+                capturing = false
+                overlay.visibility = View.VISIBLE
                 if (bitmap == null) {
                     if (scanId == generation) status.text = error ?: "Capture impossible"
                     finishScan()
@@ -420,25 +575,56 @@ class MainActivity : Activity() {
                         finishScan()
                         return@scan
                     }
-                    status.text = "${hits.size} zones — préparation des modèles de traduction…"
-                    val wifiOnly = getPreferences(MODE_PRIVATE).getBoolean("wifi_only", true)
-                    translator.prepare(src.tag, dst.tag, wifiOnly) { modelError ->
-                        if (scanId != generation || destroyed) {
-                            bitmap.recycle()
-                            finishScan()
-                            return@prepare
+                    val remaining = hits.filterNot { overlay.hasRegionAt(it.bounds, activeCaptureY) }
+                    if (remaining.isEmpty()) {
+                        status.text = "Cette partie est déjà traduite — continue à défiler"
+                        bitmap.recycle()
+                        finishScan()
+                        return@scan
+                    }
+                    if (qualityEnabled && qualityTranslator.hasKey()) {
+                        status.text = "Traduction IA : ${remaining.size} dialogues…"
+                        qualityTranslator.translateBatch(src.tag, dst.tag, remaining.map { it.text }) { texts, error ->
+                            if (scanId != generation || destroyed) {
+                                bitmap.recycle()
+                                finishScan()
+                            } else if (texts != null) {
+                                remaining.forEachIndexed { index, hit ->
+                                    overlay.addRegion(bitmap, TextRegion(hit.text, hit.bounds, texts[index]), activeCaptureY)
+                                }
+                                status.text = "IA : ${remaining.size} zones traduites — défile pour continuer"
+                                bitmap.recycle()
+                                finishScan()
+                            } else {
+                                status.text = "IA indisponible (${error ?: "erreur"}) — repli local…"
+                                translateOffline(scanId, bitmap, remaining, src.tag, dst.tag)
+                            }
                         }
-                        if (modelError != null) {
-                            status.text = "Modèle indisponible : ${modelError.localizedMessage}"
-                            bitmap.recycle()
-                            finishScan()
-                            return@prepare
-                        }
-                        translateHits(scanId, bitmap, hits, src.tag, dst.tag, 0)
+                    } else {
+                        translateOffline(scanId, bitmap, remaining, src.tag, dst.tag)
                     }
                 }
             }
         }, 85L)
+    }
+
+    private fun translateOffline(scanId: Int, bitmap: android.graphics.Bitmap, hits: List<OcrEngine.Hit>, source: String, target: String) {
+        status.text = "${hits.size} zones — préparation traduction locale…"
+        val wifiOnly = getPreferences(MODE_PRIVATE).getBoolean("wifi_only", true)
+        translator.prepare(source, target, wifiOnly) { modelError ->
+            if (scanId != generation || destroyed) {
+                bitmap.recycle()
+                finishScan()
+                return@prepare
+            }
+            if (modelError != null) {
+                status.text = "Modèle indisponible : ${modelError.localizedMessage}"
+                bitmap.recycle()
+                finishScan()
+                return@prepare
+            }
+            translateHits(scanId, bitmap, hits, source, target, 0)
+        }
     }
 
     private fun translateHits(
@@ -455,8 +641,8 @@ class MainActivity : Activity() {
             return
         }
         if (index >= hits.size) {
-            status.text = "Terminé : $translatedCount/${hits.size} zones traduites" +
-                if (translationFailures > 0) " ($translationFailures erreurs)" else ""
+            status.text = "Traduit : $translatedCount/${hits.size} zones — défile pour continuer" +
+                (if (translationFailures > 0) " ($translationFailures erreurs)" else "")
             screenshot.recycle()
             finishScan()
             return
@@ -469,7 +655,7 @@ class MainActivity : Activity() {
                 return@translate
             }
             if (error == null && !translated.isNullOrBlank()) {
-                overlay.addRegion(screenshot, TextRegion(hit.text, hit.bounds, translated))
+                overlay.addRegion(screenshot, TextRegion(hit.text, hit.bounds, translated), activeCaptureY)
                 translatedCount++
             } else {
                 translationFailures++
@@ -481,8 +667,9 @@ class MainActivity : Activity() {
 
     private fun finishScan() {
         scanning = false
+        capturing = false
         if (destroyed) return
-        if (pending) {
+        if (pending && !showOriginal) {
             pending = false
             handler.removeCallbacks(scrollRunnable)
             handler.postDelayed({ requestScan() }, 150L)
@@ -505,6 +692,7 @@ class MainActivity : Activity() {
         handler.removeCallbacksAndMessages(null)
         ocr.close()
         translator.close()
+        qualityTranslator.close()
         webView.stopLoading()
         webView.destroy()
         super.onDestroy()
