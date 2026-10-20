@@ -35,7 +35,7 @@ class OcrEngine {
         scanPass(bitmap, script) { initial, error ->
             if (initial == null) { callback(null, error); return@scanPass }
             if (bitmap.height < 1000) { callback(initial, null); return@scanPass }
-            var combined = initial
+            var combined: List<Hit> = initial
             val tileHeight = min(800, bitmap.height)
             fun next(top: Int) {
                 if (top >= bitmap.height) { callback(combined, null); return }
