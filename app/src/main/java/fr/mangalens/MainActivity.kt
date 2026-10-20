@@ -83,7 +83,7 @@ class MainActivity : Activity() {
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(background)
+            setBackgroundColor(this@MainActivity.background)
         }
         setContentView(root)
         // Android 15+ enforces edge-to-edge for targetSdk 35: keep the toolbar
@@ -125,7 +125,7 @@ class MainActivity : Activity() {
         navRow.addView(backButton, LinearLayout.LayoutParams(dp(36), dp(43)))
         backButton.setOnClickListener { if (webView.canGoBack()) webView.goBack() }
         address = EditText(this).apply {
-            singleLine = true
+            setSingleLine(true)
             textSize = 13f
             setTextColor(white)
             setHintTextColor(muted)
